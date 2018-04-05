@@ -4,7 +4,7 @@
 *&
 *& SAPscript forms breakdown helper
 *&
-*& Version 2017.2-01 (23.04.2017)
+*& latest developer version
 *&
 *& written by Michael Keller
 *&
@@ -25,7 +25,7 @@ INCLUDE <cl_alv_control>.
 
 TABLES sscrfields.
 
-CONSTANTS gc_vinfo TYPE text30 VALUE '2017.2-01 (23.04.2017)'.
+CONSTANTS gc_vinfo TYPE text30 VALUE '2018.x-01 (xx.xx.2018)'.
 
 CONSTANTS: gc_burl1(23) TYPE c VALUE 'https://blogs.sap.com',
            gc_burl2(32) TYPE c VALUE '/2016/09/19/',
@@ -53,28 +53,58 @@ TYPES: BEGIN OF operator,
 
 TYPES: operators TYPE TABLE OF operator.
 
-DATA: gs_header TYPE thead,
-      gt_lines  TYPE TABLE OF tline,
-      gt_fcat   TYPE lvc_t_fcat,
+TYPES: BEGIN OF symbol,
+         symbol   TYPE tdsymbname,
+         type     TYPE char4,
+         tabclass TYPE tabclass,
+         tabname  TYPE tabname,
+         tabart   TYPE tabart,
+         ddtext   TYPE ddtext,
+       END OF symbol.
+
+TYPES: symbols TYPE TABLE OF symbol.
+
+DATA: gt_fcat   TYPE lvc_t_fcat,
+      gt_filter TYPE lvc_t_filt,
       gr_grid   TYPE REF TO cl_gui_alv_grid,
-      gr_evhdl  TYPE REF TO lcl_event_handler.
+      gr_evhdl  TYPE REF TO lcl_event_handler,
+      gt_dd02v  TYPE TABLE OF dd02v,
+      gt_dd09l  TYPE TABLE OF dd09l.
 
 DATA: gv_nobr_space TYPE c LENGTH 1.
+
+DATA: BEGIN OF gs_form,
+        header  TYPE thead,
+        lines   TYPE TABLE OF tline,
+        pages   TYPE TABLE OF itctg,
+        pwins   TYPE TABLE OF itcth,
+        paras   TYPE TABLE OF itcdp,
+        strings TYPE TABLE OF itcds,
+        tabs    TYPE TABLE OF itcdq,
+        windows TYPE TABLE OF itctw,
+        symbols TYPE symbols,
+      END OF gs_form.
 
 DATA: BEGIN OF gt_data OCCURS 100,
         mark     TYPE xfeld,
         row      TYPE tdrow,
         window   TYPE tdwindow,
         format   TYPE tdformat,
-        original TYPE tdline,
         colexpic TYPE icon_d,
         colexpfn TYPE uffilter,
         adapted  TYPE tdline,
+        acomment TYPE text1024, " auto comment
+        ucomment TYPE text1024, " user comment
+        original TYPE tdline,
         symbol1  TYPE tdline,
         symbol2  TYPE tdline,
         symbol3  TYPE tdline,
         symbol4  TYPE tdline,
         symbol5  TYPE tdline,
+        symbol6  TYPE tdline,
+        symbol7  TYPE tdline,
+        symbol8  TYPE tdline,
+        symbol9  TYPE tdline,
         level    TYPE i,
         mccabe1  TYPE numc5,
         mccabe2  TYPE numc5,
@@ -96,6 +126,10 @@ DATA: BEGIN OF gs_stats,
         locblp TYPE numc3,
         numwin TYPE numc3, " number of windows
         numtel TYPE numc3, " number of text elements
+        ssyst  TYPE numc3, " number of system symbols
+        sstnd  TYPE numc3, " number of standard symbols
+        sprog  TYPE numc3, " number of program symbols
+        sform  TYPE numc3, " number of symbols defined in form
         mccab1 TYPE numc5, " cyclomatic complexity (single precision)
         mccab2 TYPE numc5, " cyclomatic complexity (double precision)
         hsopt  TYPE operators, " Halstead operators
@@ -122,14 +156,14 @@ SELECTION-SCREEN: BEGIN OF BLOCK bl_form WITH FRAME TITLE gv_tx005,
                   BEGIN OF LINE,
                   COMMENT 1(20) gv_tx000,
                   POSITION 25.
-PARAMETERS:       pa_mandt LIKE gs_header-mandt
+PARAMETERS:       pa_mandt LIKE gs_form-header-mandt
                            DEFAULT sy-mandt
                            MATCHCODE OBJECT salv_bs_mandt.
 SELECTION-SCREEN: END OF LINE,
                   BEGIN OF LINE,
                   COMMENT 1(20) gv_tx001,
                   POSITION 25.
-PARAMETERS:       pa_fname TYPE tdobname
+PARAMETERS:       pa_fname TYPE tdform
                            MEMORY ID txf
                            VISIBLE LENGTH 15.
 SELECTION-SCREEN: PUSHBUTTON 44(20) pb_fshow USER-COMMAND form_show
@@ -154,6 +188,12 @@ SELECTION-SCREEN: END OF LINE,
                   COMMENT 1(20) gv_tx004,
                   POSITION 25.
 PARAMETERS:       pa_tname TYPE txline.
+SELECTION-SCREEN: END OF LINE,
+                  BEGIN OF LINE,
+                  COMMENT 1(20) gv_tx026,
+                  POSITION 25.
+PARAMETERS:       pa_prprg TYPE syrepid
+                           MEMORY ID zsfbh_prprg.
 SELECTION-SCREEN: END OF LINE,
                   END OF BLOCK bl_form.
 
@@ -232,6 +272,10 @@ SELECTION-SCREEN: END OF LINE,
 PARAMETERS:       pa_idtcn TYPE n LENGTH 1 DEFAULT '3'.
 SELECTION-SCREEN: COMMENT 17(20) gv_tx024,
                   END OF LINE,
+                  BEGIN OF LINE.
+PARAMETERS:       pa_colev TYPE xfeld AS CHECKBOX.
+SELECTION-SCREEN: COMMENT 3(60) gv_tx025,
+                  END OF LINE,
                   END OF BLOCK bl_vari.
 
 * update
@@ -287,6 +331,9 @@ CLASS lcl_event_handler DEFINITION.
                   e_saved
                   e_not_processed.
 
+    CLASS-METHODS handle_after_refresh
+        FOR EVENT after_refresh OF cl_gui_alv_grid.
+
     CLASS-METHODS handle_context_menu_request
                   FOR EVENT context_menu_request OF cl_gui_alv_grid
       IMPORTING e_object
@@ -313,6 +360,48 @@ ENDCLASS.                    "lcl_event_handler DEFINITION
 *
 *----------------------------------------------------------------------*
 CLASS lcl_event_handler IMPLEMENTATION.
+
+  METHOD handle_after_refresh.
+
+    DATA ls_stable TYPE lvc_s_stbl.
+
+*   Using IMPORT-parameter IT_FILTER_LVC of REUSE_ALV_GRID_DISPLAY_LVC
+*   is useless to collapse everything when ALV is shown for the first
+*   time because a default layout has priority thus own filter will
+*   be discarded. But at this point in program flow, we can set our
+*   filter.
+    IF pa_colev = gc_yes.
+      CLEAR pa_colev.
+
+      PERFORM alv_collapse_before_show.
+
+      IF gt_filter IS NOT INITIAL.
+        CALL METHOD gr_grid->set_filter_criteria
+          EXPORTING
+            it_filter                 = gt_filter
+          EXCEPTIONS
+            no_fieldcatalog_available = 1
+            OTHERS                    = 2.
+
+        IF sy-subrc <> 0.
+          MESSAGE 'Error while collapsing rows.' TYPE 'I'.
+          RETURN.
+        ELSE.
+          CALL METHOD gr_grid->refresh_table_display
+            EXPORTING
+              is_stable      = ls_stable
+              i_soft_refresh = space
+            EXCEPTIONS
+              finished       = 1
+              OTHERS         = 2.
+
+          IF sy-subrc <> 0.
+          ENDIF.
+        ENDIF.
+      ENDIF.
+    ENDIF.
+
+  ENDMETHOD.
 
   METHOD handle_after_user_command.
 
@@ -341,6 +430,30 @@ CLASS lcl_event_handler IMPLEMENTATION.
         fcode = '&COPY'
         text  = 'Copy to clipboard'
         icon  = icon_system_copy.
+*       ftype             =
+*       disabled          =
+*       hidden            =
+*       checked           =
+*       accelerator       =
+*       insert_at_the_top = SPACE
+
+    CALL METHOD e_object->add_function
+      EXPORTING
+        fcode = '&COLLAPSE_ALL'
+        text  = 'Collapse all'.
+*        icon  =
+*       ftype             =
+*       disabled          =
+*       hidden            =
+*       checked           =
+*       accelerator       =
+*       insert_at_the_top = SPACE
+
+    CALL METHOD e_object->add_function
+      EXPORTING
+        fcode = '&EXPAND_ALL'
+        text  = 'Expand all'.
+*       icon  =
 *       ftype             =
 *       disabled          =
 *       hidden            =
@@ -391,9 +504,11 @@ CLASS lcl_event_handler IMPLEMENTATION.
 
   METHOD handle_user_command.
 
-    DATA: ls_rowid TYPE lvc_s_row,
-          ls_colid TYPE lvc_s_col,
-          ls_data  LIKE LINE OF gt_data.
+    DATA: ls_rowid   TYPE lvc_s_row,
+          ls_colid   TYPE lvc_s_col,
+          ls_data    LIKE LINE OF gt_data,
+          lv_refresh TYPE xfeld,
+          ls_stable  TYPE lvc_s_stbl.
 
     CALL METHOD gr_grid->get_current_cell
       IMPORTING
@@ -414,6 +529,14 @@ CLASS lcl_event_handler IMPLEMENTATION.
       WHEN '&COPY'.
         PERFORM alv_copy_to_clipboard.
 
+      WHEN '&COLLAPSE_ALL'.
+        PERFORM alv_collapse_all
+                CHANGING lv_refresh.
+
+      WHEN '&EXPAND_ALL'.
+        PERFORM alv_expand_all
+                CHANGING lv_refresh.
+
       WHEN '&EDIT_SAME_WINDOW'.
         PERFORM form_edit USING '1' ls_data.
 
@@ -425,6 +548,19 @@ CLASS lcl_event_handler IMPLEMENTATION.
 
       WHEN OTHERS.
     ENDCASE.
+
+    IF lv_refresh = gc_yes.
+      CALL METHOD gr_grid->refresh_table_display
+        EXPORTING
+          is_stable      = ls_stable
+          i_soft_refresh = space
+        EXCEPTIONS
+          finished       = 1
+          OTHERS         = 2.
+
+      IF sy-subrc <> 0.
+      ENDIF.
+    ENDIF.
 
   ENDMETHOD.                    "handle_user_command
 
@@ -445,6 +581,9 @@ AT SELECTION-SCREEN ON VALUE-REQUEST FOR pa_wname.
 AT SELECTION-SCREEN ON VALUE-REQUEST FOR pa_tname.
   PERFORM form_text_element_f4.
 
+AT SELECTION-SCREEN ON VALUE-REQUEST FOR pa_prprg.
+  PERFORM print_program_f4.
+
 AT SELECTION-SCREEN ON VALUE-REQUEST FOR pa_varia.
   PERFORM alv_variant_f4.
 
@@ -463,7 +602,9 @@ FORM main.
 
   DATA lv_subrc TYPE sysubrc.
 
-  CLEAR gs_stats.
+  CLEAR: gs_form,
+         gs_stats,
+         gt_fcat.
 
   PERFORM prechecks CHANGING lv_subrc.
   IF lv_subrc <> 0.
@@ -534,15 +675,6 @@ FORM alv_fcat_prepare CHANGING cv_subrc TYPE sysubrc.
 
   CLEAR ls_fcat.
   ls_fcat-col_pos = ls_fcat-col_pos + 1.
-  ls_fcat-fieldname = 'ORIGINAL'.
-  ls_fcat-tabname   = 'GT_DATA'.
-  ls_fcat-scrtext_s = 'Original'.
-  ls_fcat-scrtext_m = 'Original'.
-  ls_fcat-scrtext_l = 'Original'.
-  APPEND ls_fcat TO gt_fcat.
-
-  CLEAR ls_fcat.
-  ls_fcat-col_pos = ls_fcat-col_pos + 1.
   ls_fcat-fieldname = 'COLEXPIC'.
   ls_fcat-tabname   = 'GT_DATA'.
   ls_fcat-icon      = gc_yes.
@@ -570,6 +702,35 @@ FORM alv_fcat_prepare CHANGING cv_subrc TYPE sysubrc.
   ls_fcat-scrtext_s = 'Adapted'.
   ls_fcat-scrtext_m = 'Adapted'.
   ls_fcat-scrtext_l = 'Adapted'.
+  APPEND ls_fcat TO gt_fcat.
+
+  CLEAR ls_fcat.
+  ls_fcat-col_pos = ls_fcat-col_pos + 1.
+  ls_fcat-fieldname = 'ACOMMENT'.
+  ls_fcat-tabname   = 'GT_DATA'.
+  ls_fcat-scrtext_s = 'auto comm.'.
+  ls_fcat-scrtext_m = 'auto comment'.
+  ls_fcat-scrtext_l = 'auto comment'.
+  APPEND ls_fcat TO gt_fcat.
+
+  CLEAR ls_fcat.
+  ls_fcat-col_pos = ls_fcat-col_pos + 1.
+  ls_fcat-fieldname = 'UCOMMENT'.
+  ls_fcat-tabname   = 'GT_DATA'.
+  ls_fcat-scrtext_s = 'user comm.'.
+  ls_fcat-scrtext_m = 'user comment'.
+  ls_fcat-scrtext_l = 'user comment'.
+  ls_fcat-tech      = gc_yes.
+  ls_fcat-no_out    = gc_yes.
+  APPEND ls_fcat TO gt_fcat.
+
+  CLEAR ls_fcat.
+  ls_fcat-col_pos = ls_fcat-col_pos + 1.
+  ls_fcat-fieldname = 'ORIGINAL'.
+  ls_fcat-tabname   = 'GT_DATA'.
+  ls_fcat-scrtext_s = 'Original'.
+  ls_fcat-scrtext_m = 'Original'.
+  ls_fcat-scrtext_l = 'Original'.
   APPEND ls_fcat TO gt_fcat.
 
   CLEAR ls_fcat.
@@ -615,6 +776,42 @@ FORM alv_fcat_prepare CHANGING cv_subrc TYPE sysubrc.
   ls_fcat-scrtext_s = 'Symbol 5'.
   ls_fcat-scrtext_m = 'Symbol 5'.
   ls_fcat-scrtext_l = 'Symbol 5'.
+  APPEND ls_fcat TO gt_fcat.
+
+  CLEAR ls_fcat.
+  ls_fcat-col_pos = ls_fcat-col_pos + 1.
+  ls_fcat-fieldname = 'SYMBOL6'.
+  ls_fcat-tabname   = 'GT_DATA'.
+  ls_fcat-scrtext_s = 'Symbol 6'.
+  ls_fcat-scrtext_m = 'Symbol 6'.
+  ls_fcat-scrtext_l = 'Symbol 6'.
+  APPEND ls_fcat TO gt_fcat.
+
+  CLEAR ls_fcat.
+  ls_fcat-col_pos = ls_fcat-col_pos + 1.
+  ls_fcat-fieldname = 'SYMBOL7'.
+  ls_fcat-tabname   = 'GT_DATA'.
+  ls_fcat-scrtext_s = 'Symbol 7'.
+  ls_fcat-scrtext_m = 'Symbol 7'.
+  ls_fcat-scrtext_l = 'Symbol 7'.
+  APPEND ls_fcat TO gt_fcat.
+
+  CLEAR ls_fcat.
+  ls_fcat-col_pos = ls_fcat-col_pos + 1.
+  ls_fcat-fieldname = 'SYMBOL8'.
+  ls_fcat-tabname   = 'GT_DATA'.
+  ls_fcat-scrtext_s = 'Symbol 8'.
+  ls_fcat-scrtext_m = 'Symbol 8'.
+  ls_fcat-scrtext_l = 'Symbol 8'.
+  APPEND ls_fcat TO gt_fcat.
+
+  CLEAR ls_fcat.
+  ls_fcat-col_pos = ls_fcat-col_pos + 1.
+  ls_fcat-fieldname = 'SYMBOL9'.
+  ls_fcat-tabname   = 'GT_DATA'.
+  ls_fcat-scrtext_s = 'Symbol 9'.
+  ls_fcat-scrtext_m = 'Symbol 9'.
+  ls_fcat-scrtext_l = 'Symbol 9'.
   APPEND ls_fcat TO gt_fcat.
 
   CLEAR ls_fcat.
@@ -672,10 +869,9 @@ FORM alv_data_prepare CHANGING cv_subrc TYPE sysubrc.
   FIELD-SYMBOLS: <fs_lines>   TYPE tline,
                  <fs_symbols> TYPE itcst.
 
-
   IF pa_wname IS NOT INITIAL.
 *   reduce to relevant window data
-    READ TABLE gt_lines TRANSPORTING NO FIELDS
+    READ TABLE gs_form-lines TRANSPORTING NO FIELDS
                         WITH KEY tdformat = '/W'
                                  tdline   = pa_wname.
     IF sy-subrc <> 0.
@@ -685,7 +881,7 @@ FORM alv_data_prepare CHANGING cv_subrc TYPE sysubrc.
 
     lv_begin = sy-tabix.
 
-    LOOP AT gt_lines INTO ls_lines FROM lv_begin.
+    LOOP AT gs_form-lines INTO ls_lines FROM lv_begin.
       IF ls_lines-tdformat = '/W' AND ls_lines-tdline <> pa_wname.
         EXIT.
       ENDIF.
@@ -706,12 +902,12 @@ FORM alv_data_prepare CHANGING cv_subrc TYPE sysubrc.
     ENDLOOP.
 
     IF lt_lines IS NOT INITIAL.
-      CLEAR gt_lines.
-      gt_lines = lt_lines.
+      CLEAR gs_form-lines.
+      gs_form-lines = lt_lines.
     ENDIF.
   ENDIF.
 
-  LOOP AT gt_lines ASSIGNING <fs_lines>.
+  LOOP AT gs_form-lines ASSIGNING <fs_lines>.
     CLEAR: ls_data,
            lt_lines.
 
@@ -747,18 +943,33 @@ FORM alv_data_prepare CHANGING cv_subrc TYPE sysubrc.
           symbols = lt_symbols.
 
       LOOP AT lt_symbols ASSIGNING <fs_symbols>.
-        CASE sy-tabix.
-          WHEN '1'.
-            ls_data-symbol1 = <fs_symbols>-name.
-          WHEN '2'.
-            ls_data-symbol2 = <fs_symbols>-name.
-          WHEN '3'.
-            ls_data-symbol3 = <fs_symbols>-name.
-          WHEN '4'.
-            ls_data-symbol4 = <fs_symbols>-name.
-          WHEN '5'.
-            ls_data-symbol5 = <fs_symbols>-name.
-        ENDCASE.
+*       only nine symbols are taken into account for ALV
+        IF sy-tabix < 10.
+          CASE sy-tabix.
+            WHEN '1'.
+              ls_data-symbol1 = <fs_symbols>-name.
+            WHEN '2'.
+              ls_data-symbol2 = <fs_symbols>-name.
+            WHEN '3'.
+              ls_data-symbol3 = <fs_symbols>-name.
+            WHEN '4'.
+              ls_data-symbol4 = <fs_symbols>-name.
+            WHEN '5'.
+              ls_data-symbol5 = <fs_symbols>-name.
+            WHEN '6'.
+              ls_data-symbol5 = <fs_symbols>-name.
+            WHEN '7'.
+              ls_data-symbol5 = <fs_symbols>-name.
+            WHEN '8'.
+              ls_data-symbol5 = <fs_symbols>-name.
+            WHEN '9'.
+              ls_data-symbol5 = <fs_symbols>-name.
+          ENDCASE.
+        ENDIF.
+
+*       get more information about actual symbol
+        PERFORM symbol_info_collect USING    <fs_symbols>
+                                    CHANGING ls_data.
       ENDLOOP.
     ENDIF.
 
@@ -833,18 +1044,20 @@ FORM alv_show CHANGING cv_subrc TYPE sysubrc.
         ls_evexit TYPE slis_event_exit,
         lt_excl   TYPE slis_t_extab,
         ls_vari   TYPE disvariant,
-        lv_cbpfs  TYPE slis_formname.
+        lv_cbpfs  TYPE slis_formname,
+        lv_msg    TYPE text200.
 
   FIELD-SYMBOLS <fs_events> TYPE slis_alv_event.
 
   ls_layout-box_fname  = 'MARK'.
   ls_layout-ctab_fname = 'COLOR'.
   ls_layout-stylefname = 'STYLE'.
-  ls_layout-col_opt = 'X'.
+  ls_layout-col_opt    = 'X'.
 
   ls_vari-report   = sy-repid.
   ls_vari-handle   = 'SFBH'.
   ls_vari-username = sy-uname.
+  ls_vari-variant  = pa_varia.
 
   CALL FUNCTION 'REUSE_ALV_EVENTS_GET'
     EXPORTING
@@ -874,6 +1087,8 @@ FORM alv_show CHANGING cv_subrc TYPE sysubrc.
   APPEND ls_evexit TO lt_evexit.
 
   PERFORM alv_exclude_fcodes CHANGING lt_excl.
+
+  MESSAGE 'Form loaded.' TYPE 'S'.
 
   CALL FUNCTION 'REUSE_ALV_GRID_DISPLAY_LVC'
     EXPORTING
@@ -969,6 +1184,8 @@ FORM initialization.
   gv_tx022 = 'Color code'.
   gv_tx023 = 'Indentation'.
   gv_tx024 = 'times blank (max. 4)'.
+  gv_tx025 = 'start with collapsed IF/CASE statements to reduce complexity'.
+  gv_tx026 = 'Print program'.
 
   CONCATENATE 'Your version:' gc_vinfo INTO gv_tx018 SEPARATED BY space.
 
@@ -1311,19 +1528,17 @@ FORM alv_caller_exit USING us_data TYPE slis_data_caller_exit.
   DATA: lt_f4        TYPE lvc_t_f4,
         ls_f4        TYPE lvc_s_f4,
         lr_functions TYPE REF TO cl_salv_functions,
-        lv_title     TYPE syst_title.
+        lv_title     LIKE sy-title.
 
-  CONCATENATE gs_header-tdform
+  CONCATENATE gs_form-header-tdform
               '/'
-              gs_header-tdspras
+              gs_form-header-tdspras
               '/'
-              gs_header-mandt INTO lv_title.
+              gs_form-header-mandt INTO lv_title.
 
   CONCATENATE 'SAPscript forms breakdown helper on'
               lv_title
               INTO sy-title SEPARATED BY space.
-
-*  sy-title = 'SAPscript forms breakdown helper on '.
 
   CALL FUNCTION 'GET_GLOBALS_FROM_SLVC_FULLSCR'
 *   EXPORTING
@@ -1360,6 +1575,9 @@ FORM alv_caller_exit USING us_data TYPE slis_data_caller_exit.
 
   IF sy-subrc <> 0. " without error handling
   ENDIF.
+
+  SET HANDLER lcl_event_handler=>handle_after_refresh
+              FOR gr_grid.
 
   SET HANDLER lcl_event_handler=>handle_after_user_command
               FOR gr_grid.
@@ -1405,12 +1623,16 @@ FORM alv_handle_double_click CHANGING cs_sfield TYPE slis_selfield
     ENDIF.
   ELSEIF cs_sfield-fieldname = 'COLEXPIC' AND
          cs_data-colexpic = icon_collapse.
-    PERFORM alv_collapse
+    PERFORM alv_collapse_single
             CHANGING cs_sfield
                      cs_data.
   ELSEIF cs_sfield-fieldname = 'COLEXPIC' AND
          cs_data-colexpic = icon_expand.
     PERFORM alv_expand
+            CHANGING cs_sfield
+                     cs_data.
+  ELSEIF cs_sfield-fieldname CS 'SYMBOL'.
+    PERFORM form_symbol_definition
             CHANGING cs_sfield
                      cs_data.
   ENDIF.
@@ -1761,6 +1983,8 @@ FORM form_window_f4.
 
   TYPES: BEGIN OF values,
            wname TYPE tdwindow,
+           wdesc TYPE tdtext,
+           wtype TYPE tdwtype,
          END OF values.
 
   DATA: lt_values TYPE TABLE OF values,
@@ -1768,21 +1992,22 @@ FORM form_window_f4.
         lt_return TYPE TABLE OF ddshretval,
         lv_subrc  TYPE sysubrc.
 
-  FIELD-SYMBOLS <fs_lines> TYPE tline.
+  FIELD-SYMBOLS <fs_windows> TYPE itctw.
 
-  CLEAR gt_lines.
+  CLEAR gs_form-lines.
 
   PERFORM form_read
           USING    gc_yes
           CHANGING lv_subrc.
 
-  IF lv_subrc <> 0 OR gt_lines IS INITIAL.
+  IF lv_subrc <> 0 OR gs_form-lines IS INITIAL.
     RETURN.
   ENDIF.
 
-  LOOP AT gt_lines ASSIGNING <fs_lines> WHERE tdformat = '/W'
-                                        AND   tdline <> '%%DOCU'.
-    ls_values = <fs_lines>-tdline.
+  LOOP AT gs_form-windows ASSIGNING <fs_windows>.
+    ls_values-wname = <fs_windows>-tdwindow.
+    ls_values-wdesc = <fs_windows>-tdtext.
+    ls_values-wtype = <fs_windows>-tdwtype.
     APPEND ls_values TO lt_values.
   ENDLOOP.
 
@@ -1833,7 +2058,10 @@ FORM form_read USING    uv_selsc TYPE xfeld
                CHANGING cv_subrc TYPE sysubrc.
 
   DATA: lt_fields TYPE TABLE OF dynpread,
-        ls_fields TYPE dynpread.
+        ls_fields TYPE dynpread,
+        lv_found  TYPE char1.
+
+  CLEAR gs_form.
 
   IF uv_selsc = gc_yes.
 *   get current values from selection screen
@@ -1894,43 +2122,44 @@ FORM form_read USING    uv_selsc TYPE xfeld
     ENDLOOP.
   ENDIF.
 
-  CALL FUNCTION 'READ_TEXT'
+  CALL FUNCTION 'READ_FORM'
     EXPORTING
-      client                  = pa_mandt
-      id                      = 'TXT'
-      language                = pa_flang
-      name                    = pa_fname
-      object                  = 'FORM'
-*     ARCHIVE_HANDLE          = 0
-*     LOCAL_CAT               = ' '
+      client       = pa_mandt
+      form         = pa_fname
+      language     = pa_flang
+*     OLANGUAGE    = ' '
+*     OSTATUS      = ' '
+*     STATUS       = ' '
+*     THROUGHCLIENT          = ' '
+*     READ_ONLY_HEADER       = ' '
+*     THROUGHLANGUAGE        = ' '
     IMPORTING
-      header                  = gs_header
-*     OLD_LINE_COUNTER        =
+*     FORM_HEADER  =
+      found        = lv_found
+      header       = gs_form-header
+*     OLANGUAGE    =
     TABLES
-      lines                   = gt_lines
-    EXCEPTIONS
-      id                      = 1
-      language                = 2
-      name                    = 3
-      not_found               = 4
-      object                  = 5
-      reference_check         = 6
-      wrong_access_to_archive = 7
-      OTHERS                  = 8.
+      form_lines   = gs_form-lines
+      pages        = gs_form-pages
+      page_windows = gs_form-pwins
+      paragraphs   = gs_form-paras
+      strings      = gs_form-strings
+      tabs         = gs_form-tabs
+      windows      = gs_form-windows.
 
-  CASE sy-subrc.
-    WHEN 0.
-
-    WHEN 4.
-      cv_subrc = sy-subrc.
-      MESSAGE 'Form not found.' TYPE 'I'.
+  IF lv_found = gc_yes.
+    IF gs_form-header IS NOT INITIAL.
       RETURN.
-
-    WHEN OTHERS.
-      cv_subrc = sy-subrc.
+    ELSE.
+      cv_subrc = 4.
       MESSAGE 'Error while reading form.' TYPE 'I'.
       RETURN.
-  ENDCASE.
+    ENDIF.
+  ELSE.
+    cv_subrc = 4.
+    MESSAGE 'Form not found.' TYPE 'I'.
+    RETURN.
+  ENDIF.
 
 ENDFORM.                    " FORMULAR_READ
 *&---------------------------------------------------------------------*
@@ -1945,7 +2174,7 @@ FORM form_text_element_f4.
 
   TYPES: BEGIN OF values,
            wname TYPE tdwindow,
-           tname TYPE tdline,
+           tname TYPE txfistring,
          END OF values.
 
   DATA: lt_values TYPE TABLE OF values,
@@ -1955,17 +2184,17 @@ FORM form_text_element_f4.
         lv_tabix  TYPE sytabix,
         lt_dynpf  TYPE TABLE OF dynpread,
         ls_dynpf  TYPE dynpread,
-        lt_fields TYPE TABLE OF dfies.
+        lt_fields TYPE TABLE OF dfies,
+        lt_dselc  TYPE TABLE OF dselc,
+        ls_dselc  TYPE dselc.
 
   FIELD-SYMBOLS <fs_lines> TYPE tline.
-
-  CLEAR gt_lines.
 
   PERFORM form_read
           USING    gc_yes
           CHANGING lv_subrc.
 
-  IF lv_subrc <> 0 OR gt_lines IS INITIAL.
+  IF lv_subrc <> 0 OR gs_form-lines IS INITIAL.
     RETURN.
   ENDIF.
 
@@ -2012,7 +2241,7 @@ FORM form_text_element_f4.
 
   IF sy-subrc = 0 AND ls_dynpf-fieldvalue IS NOT INITIAL.
     TRANSLATE ls_dynpf-fieldvalue TO UPPER CASE.
-    READ TABLE gt_lines TRANSPORTING NO FIELDS
+    READ TABLE gs_form-lines TRANSPORTING NO FIELDS
                         WITH KEY tdformat = '/W'
                                  tdline   = ls_dynpf-fieldvalue.
 
@@ -2025,7 +2254,7 @@ FORM form_text_element_f4.
 
 *   text elements of a specific window
     ls_values-wname = ls_dynpf-fieldvalue.
-    LOOP AT gt_lines ASSIGNING <fs_lines> FROM lv_tabix
+    LOOP AT gs_form-lines ASSIGNING <fs_lines> FROM lv_tabix
                                           WHERE tdformat = '/W'
                                           OR    tdformat = '/E'.
       IF <fs_lines>-tdformat = '/E'.
@@ -2037,8 +2266,8 @@ FORM form_text_element_f4.
     ENDLOOP.
   ELSE.
 *   all text elements of form
-    LOOP AT gt_lines ASSIGNING <fs_lines> WHERE tdformat = '/W'
-                                          OR    tdformat = '/E'.
+    LOOP AT gs_form-lines ASSIGNING <fs_lines> WHERE tdformat = '/W'
+                                               OR    tdformat = '/E'.
 
       IF <fs_lines>-tdformat = '/W'.
         ls_values-wname = <fs_lines>-tdline.
@@ -2050,9 +2279,6 @@ FORM form_text_element_f4.
       ENDIF.
     ENDLOOP.
   ENDIF.
-
-  DATA: lt_dselc TYPE TABLE OF dselc,
-        ls_dselc TYPE dselc.
 
   ls_dselc-fldname = 'F0001'.
   ls_dselc-dyfldname = 'PA_WNAME'.
@@ -2174,21 +2400,16 @@ ENDFORM.
 FORM alv_collapse CHANGING cs_sfield TYPE slis_selfield
                            cs_data   LIKE LINE OF gt_data.
 
-  DATA: lt_filter TYPE lvc_t_filt,
-        ls_filter TYPE lvc_s_filt,
-        lv_rint   TYPE qfranint,
-        lv_rnumc  TYPE numc4.
+  DATA: "lt_filter TYPE lvc_t_filt,
+    ls_filter TYPE lvc_s_filt,
+    lv_rint   TYPE qfranint,
+    lv_rnumc  TYPE numc4.
 
   FIELD-SYMBOLS <fs_data> LIKE LINE OF gt_data.
 
-  IF gr_grid IS INITIAL.
-    MESSAGE 'Error while collapsing rows.' TYPE 'I'.
-    RETURN.
-  ENDIF.
-
-  CALL METHOD gr_grid->get_filter_criteria
-    IMPORTING
-      et_filter = lt_filter.
+*  CALL METHOD gr_grid->get_filter_criteria
+*    IMPORTING
+*      et_filter = lt_filter.
 
 * create individual value for filter
   CALL FUNCTION 'QF05_RANDOM_INTEGER'
@@ -2215,10 +2436,10 @@ FORM alv_collapse CHANGING cs_sfield TYPE slis_selfield
     ELSE. " filter
       IF <fs_data>-colexpfn IS NOT INITIAL.
 *       delete older filter if exists
-        READ TABLE lt_filter TRANSPORTING NO FIELDS
+        READ TABLE gt_filter TRANSPORTING NO FIELDS
                              WITH KEY low = <fs_data>-colexpfn.
         IF sy-subrc = 0.
-          DELETE lt_filter INDEX sy-tabix.
+          DELETE gt_filter INDEX sy-tabix.
         ENDIF.
         IF <fs_data>-colexpic = icon_expand.
           <fs_data>-colexpic = icon_collapse.
@@ -2252,20 +2473,20 @@ FORM alv_collapse CHANGING cs_sfield TYPE slis_selfield
   ls_filter-sign      = 'E'.
   ls_filter-option    = 'EQ'.
   CONCATENATE 'F-' ls_filter-low INTO ls_filter-low.
-  ls_filter-order = lines( lt_filter ) + 1.
-  APPEND ls_filter TO lt_filter.
+  ls_filter-order = lines( gt_filter ) + 1.
+  APPEND ls_filter TO gt_filter.
 
-  CALL METHOD gr_grid->set_filter_criteria
-    EXPORTING
-      it_filter                 = lt_filter
-    EXCEPTIONS
-      no_fieldcatalog_available = 1
-      OTHERS                    = 2.
-
-  IF sy-subrc <> 0.
-    MESSAGE 'Error while collapsing rows.' TYPE 'I'.
-    RETURN.
-  ENDIF.
+*  CALL METHOD gr_grid->set_filter_criteria
+*    EXPORTING
+*      it_filter                 = lt_filter
+*    EXCEPTIONS
+*      no_fieldcatalog_available = 1
+*      OTHERS                    = 2.
+*
+*  IF sy-subrc <> 0.
+*    MESSAGE 'Error while collapsing rows.' TYPE 'I'.
+*    RETURN.
+*  ENDIF.
 
   cs_sfield-refresh = gc_yes.
   cs_data-colexpic = icon_expand.
@@ -2284,7 +2505,10 @@ FORM alv_expand CHANGING cs_sfield TYPE slis_selfield
 
   DATA: lt_filter TYPE lvc_t_filt,
         ls_filter TYPE lvc_s_filt,
-        ls_data   LIKE LINE OF gt_data.
+        ls_data   LIKE LINE OF gt_data,
+        ls_sfield TYPE slis_selfield.
+
+  FIELD-SYMBOLS <fs_data> LIKE LINE OF gt_data.
 
   IF cs_data-colexpfn IS INITIAL.
     MESSAGE 'Error while expanding rows.' TYPE 'I'.
@@ -2299,6 +2523,7 @@ FORM alv_expand CHANGING cs_sfield TYPE slis_selfield
     IMPORTING
       et_filter = lt_filter.
 
+* remove filter from list of all filter
   DELETE lt_filter WHERE low = ls_filter-low.
   IF sy-subrc <> 0.
     MESSAGE 'Error while expanding rows.' TYPE 'I'.
@@ -2317,6 +2542,19 @@ FORM alv_expand CHANGING cs_sfield TYPE slis_selfield
     RETURN.
   ENDIF.
 
+* for better overview, hide every path within the old filter
+  LOOP AT gt_data ASSIGNING <fs_data>
+                  WHERE format = '/:'
+                  AND   colexpic IS NOT INITIAL
+                  AND   colexpfn = ls_filter-low.
+
+    ls_sfield-tabindex = sy-tabix.
+
+    PERFORM alv_collapse_single USING ls_sfield
+                                      <fs_data>.
+  ENDLOOP.
+
+* remove filter from memory
   MODIFY gt_data FROM ls_data
                  TRANSPORTING colexpfn
                  WHERE colexpfn = ls_filter-low.
@@ -2755,7 +2993,8 @@ FORM form_include_show CHANGING cs_sfield TYPE slis_selfield
         lv_id    TYPE tdid,
         lv_spras TYPE tdspras,
         lt_bdcdt TYPE bdcdata OCCURS 20,
-        ls_bdcdt TYPE bdcdata.
+        ls_bdcdt TYPE bdcdata,
+        lv_count TYPE i.
 
   TRANSLATE cs_data-original TO UPPER CASE.
 
@@ -2785,8 +3024,13 @@ FORM form_include_show CHANGING cs_sfield TYPE slis_selfield
         RETURN.
       ENDIF.
 
-*     check if name consists of different parts
-      IF ls_parts CA ''''.
+*     check how many quotes we have
+      FIND ALL OCCURRENCES OF ''''
+           IN ls_parts
+           MATCH COUNT lv_count.
+
+      IF lv_count = 1.
+*       name consists of different parts
         DO.
           CONCATENATE lv_name ls_parts INTO lv_name
                                        SEPARATED BY space.
@@ -2821,7 +3065,7 @@ FORM form_include_show CHANGING cs_sfield TYPE slis_selfield
     lv_tabix = sy-tabix + 1.
     READ TABLE lt_parts INTO ls_parts INDEX lv_tabix.
     IF sy-subrc <> 0.
-      lv_id = gs_header-tdid.
+      lv_id = gs_form-header-tdid.
     ELSE.
       REPLACE ALL OCCURRENCES OF '''' IN ls_parts WITH space.
       SHIFT ls_parts LEFT DELETING LEADING space.
@@ -2834,12 +3078,17 @@ FORM form_include_show CHANGING cs_sfield TYPE slis_selfield
                       WITH KEY table_line = 'LANGUAGE'.
 
   IF sy-subrc <> 0.
-    lv_spras = gs_header-tdspras.
+    lv_spras = gs_form-header-tdspras.
   ELSE.
     lv_tabix = sy-tabix + 1.
     READ TABLE lt_parts INTO ls_parts INDEX lv_tabix.
     IF sy-subrc <> 0.
     ELSE.
+      IF ls_parts CA '&'.
+        MESSAGE 'INCLUDE is dynamic.' TYPE 'I'.
+        RETURN.
+      ENDIF.
+
       REPLACE ALL OCCURRENCES OF '''' IN ls_parts WITH space.
       SHIFT ls_parts LEFT DELETING LEADING space.
       lv_spras = ls_parts.
@@ -3099,6 +3348,46 @@ FORM form_stats_show.
   MESSAGE s499 WITH 'Number of text elements:'
                     gs_stats-numtel
                INTO ls_msgs-message.
+  PERFORM messages_collect CHANGING lt_msgs.
+
+  IF gs_stats-ssyst CO space.
+    MESSAGE s499 WITH 'Number of system symbols: 0'
+                 INTO ls_msgs-message.
+  ELSE.
+    MESSAGE s499 WITH 'Number of system symbols:'
+                      gs_stats-ssyst
+                 INTO ls_msgs-message.
+  ENDIF.
+  PERFORM messages_collect CHANGING lt_msgs.
+
+  IF gs_stats-sstnd CO space.
+    MESSAGE s499 WITH 'Number of standard symbols: 0'
+                 INTO ls_msgs-message.
+  ELSE.
+    MESSAGE s499 WITH 'Number of standard symbols:'
+                      gs_stats-sstnd
+                 INTO ls_msgs-message.
+  ENDIF.
+  PERFORM messages_collect CHANGING lt_msgs.
+
+  IF gs_stats-sprog CO space.
+    MESSAGE s499 WITH 'Number of program symbols: 0'
+                 INTO ls_msgs-message.
+  ELSE.
+    MESSAGE s499 WITH 'Number of program symbols:'
+                      gs_stats-sprog
+                 INTO ls_msgs-message.
+  ENDIF.
+  PERFORM messages_collect CHANGING lt_msgs.
+
+  IF gs_stats-sform CO space.
+    MESSAGE s499 WITH 'Number of form symbols: 0'
+                 INTO ls_msgs-message.
+  ELSE.
+    MESSAGE s499 WITH 'Number of form symbols:'
+                      gs_stats-sform
+                 INTO ls_msgs-message.
+  ENDIF.
   PERFORM messages_collect CHANGING lt_msgs.
 
 * source lines of code
@@ -3454,6 +3743,10 @@ FORM form_stats_calculate.
   SHIFT gs_stats-hsdif  LEFT DELETING LEADING '0'.
   SHIFT gs_stats-hseff  LEFT DELETING LEADING '0'.
   SHIFT gs_stats-hstti  LEFT DELETING LEADING '0'.
+  SHIFT gs_stats-ssyst  LEFT DELETING LEADING '0'.
+  SHIFT gs_stats-sstnd  LEFT DELETING LEADING '0'.
+  SHIFT gs_stats-sprog  LEFT DELETING LEADING '0'.
+  SHIFT gs_stats-sform  LEFT DELETING LEADING '0'.
 
 ENDFORM.
 *&---------------------------------------------------------------------*
@@ -3589,5 +3882,542 @@ FORM sscmds_fill.
   sscmd_add 'TEXT'.
   sscmd_add 'STRING'.
   sscmd_add 'PAGE'.
+
+ENDFORM.
+*&---------------------------------------------------------------------*
+*&      Form  ALV_COLLAPSE_ALL
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM alv_collapse_all CHANGING cv_refresh TYPE xfeld.
+
+  DATA ls_sfield TYPE slis_selfield.
+
+  FIELD-SYMBOLS <fs_data> LIKE LINE OF gt_data.
+
+  IF gr_grid IS INITIAL.
+    MESSAGE 'Error while collapsing rows.' TYPE 'I'.
+    RETURN.
+  ENDIF.
+
+  CALL METHOD gr_grid->get_filter_criteria
+    IMPORTING
+      et_filter = gt_filter.
+
+  LOOP AT gt_data ASSIGNING <fs_data>
+                  WHERE format = '/:'
+                  AND   colexpic IS NOT INITIAL
+                  AND   level = 0.
+
+    ls_sfield-tabindex = sy-tabix.
+
+    PERFORM alv_collapse USING ls_sfield
+                               <fs_data>.
+  ENDLOOP.
+
+  CALL METHOD gr_grid->set_filter_criteria
+    EXPORTING
+      it_filter                 = gt_filter
+    EXCEPTIONS
+      no_fieldcatalog_available = 1
+      OTHERS                    = 2.
+
+  IF sy-subrc <> 0.
+    MESSAGE 'Error while collapsing rows.' TYPE 'I'.
+    RETURN.
+  ENDIF.
+
+  IF sy-subrc = 0.
+    cv_refresh = gc_yes.
+  ENDIF.
+
+ENDFORM.
+*&---------------------------------------------------------------------*
+*&      Form  ALV_EXPAND_ALL
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      <--P_LV_REFRESH  text
+*----------------------------------------------------------------------*
+FORM alv_expand_all CHANGING cv_refresh TYPE xfeld.
+
+  DATA ls_sfield TYPE slis_selfield.
+
+  FIELD-SYMBOLS <fs_data> LIKE LINE OF gt_data.
+
+  LOOP AT gt_data ASSIGNING <fs_data>
+                  WHERE format = '/:'
+                  AND   colexpic = icon_expand.
+
+    PERFORM alv_expand USING ls_sfield
+                             <fs_data>.
+
+  ENDLOOP.
+
+  IF sy-subrc = 0.
+    cv_refresh = gc_yes.
+  ENDIF.
+
+ENDFORM.
+*&---------------------------------------------------------------------*
+*&      Form  ALV_COLLAPSE_SINGLE
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      <--P_CS_SFIELD  text
+*      <--P_CS_DATA  text
+*----------------------------------------------------------------------*
+FORM alv_collapse_single CHANGING cs_sfield TYPE slis_selfield
+                                  cs_data   LIKE LINE OF gt_data.
+
+  IF gr_grid IS INITIAL.
+    MESSAGE 'Error while collapsing rows.' TYPE 'I'.
+    RETURN.
+  ENDIF.
+
+  CALL METHOD gr_grid->get_filter_criteria
+    IMPORTING
+      et_filter = gt_filter.
+
+  PERFORM alv_collapse CHANGING cs_sfield cs_data.
+
+  CALL METHOD gr_grid->set_filter_criteria
+    EXPORTING
+      it_filter                 = gt_filter
+    EXCEPTIONS
+      no_fieldcatalog_available = 1
+      OTHERS                    = 2.
+
+  IF sy-subrc <> 0.
+    MESSAGE 'Error while collapsing rows.' TYPE 'I'.
+    RETURN.
+  ENDIF.
+
+*  cs_sfield-refresh = gc_yes.
+*  cs_data-colexpic = icon_expand.
+
+ENDFORM.
+*&---------------------------------------------------------------------*
+*&      Form  ALV_COLLAPSE_BEFORE_SHOW
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM alv_collapse_before_show.
+
+  DATA ls_sfield TYPE slis_selfield.
+
+  FIELD-SYMBOLS <fs_data> LIKE LINE OF gt_data.
+
+  LOOP AT gt_data ASSIGNING <fs_data>
+                   WHERE format = '/:'
+                   AND   colexpic IS NOT INITIAL
+                   AND   level = 0.
+
+    ls_sfield-tabindex = sy-tabix.
+
+    PERFORM alv_collapse USING ls_sfield
+                               <fs_data>.
+  ENDLOOP.
+
+ENDFORM.
+*&---------------------------------------------------------------------*
+*&      Form  FORM_SYMBOL_GOTO
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      <--P_CS_SFIELD  text
+*      <--P_CS_DATA  text
+*----------------------------------------------------------------------*
+FORM form_symbol_definition CHANGING cs_sfield TYPE slis_selfield
+                                     cs_data   LIKE LINE OF gt_data.
+
+  DATA: ls_col   TYPE lvc_s_col,
+        ls_row   TYPE lvc_s_row,
+        ls_ctrl  TYPE REF TO cl_gui_control,
+        ls_lcont TYPE tline,
+        lv_name  TYPE tdform.
+
+  FIELD-SYMBOLS: <fs_symbol> TYPE tdline,
+                 <fs_data>   LIKE LINE OF gt_data.
+
+  ASSIGN COMPONENT cs_sfield-fieldname OF STRUCTURE cs_data
+                                       TO <fs_symbol>.
+
+  IF sy-subrc <> 0.
+    MESSAGE 'Symbol definition not found.' TYPE 'I'.
+    RETURN.
+  ENDIF.
+
+  IF <fs_symbol> IS INITIAL.
+    MESSAGE 'No symbol found.' TYPE 'I'.
+    RETURN.
+  ENDIF.
+
+* find definition in SAPscript
+  LOOP AT gt_data ASSIGNING <fs_data>
+                  WHERE format = '/:'
+                  AND   original CS 'DEFINE'
+                  AND   original CS <fs_symbol>.
+
+    ls_row-index = sy-tabix.
+    EXIT.
+  ENDLOOP.
+
+* go to definition in SAPscript
+  IF sy-subrc = 0.
+    ls_col-fieldname = 'ADAPTED'.
+
+    CALL METHOD gr_grid->set_current_cell_via_id
+      EXPORTING
+        is_row_id    = ls_row
+        is_column_id = ls_col.
+*       is_row_no         =
+
+    CALL METHOD cl_gui_alv_grid=>get_focus
+      IMPORTING
+        control           = ls_ctrl
+      EXCEPTIONS
+        cntl_error        = 1
+        cntl_system_error = 2
+        OTHERS            = 3.
+
+    IF sy-subrc <> 0.
+      MESSAGE 'Symbol definition not found.' TYPE 'I'.
+      RETURN.
+    ENDIF.
+
+    CALL METHOD gr_grid->set_focus
+      EXPORTING
+        control           = ls_ctrl
+      EXCEPTIONS
+        cntl_error        = 1
+        cntl_system_error = 2
+        OTHERS            = 3.
+
+    IF sy-subrc <> 0.
+      MESSAGE 'Symbol definition not found.' TYPE 'I'.
+      RETURN.
+    ENDIF.
+
+    RETURN.
+  ENDIF.
+
+  CONCATENATE '&' <fs_symbol> '&' INTO ls_lcont-tdline.
+  lv_name = gs_form-header-tdname.
+
+* symbol is defined in printer program
+  CALL FUNCTION 'SAPSCRIPT_SYMBOL_DEFINITION'
+    EXPORTING
+      line_contents              = ls_lcont
+      cursor_position            = 2
+      layout_set                 = lv_name
+*     DIALOG                     = 'X'
+*     LINE_EDITOR                = ' '
+    EXCEPTIONS
+      no_symbol_in_line          = 1
+      cursor_before_first_symbol = 2
+      cursor_not_on_symbol       = 3
+      not_executed               = 4
+      OTHERS                     = 5.
+
+  IF sy-subrc = 0 OR sy-subrc = 4.
+    RETURN.
+  ELSE.
+    MESSAGE 'Symbol definition not found.' TYPE 'I'.
+    RETURN.
+  ENDIF.
+
+ENDFORM.
+*&---------------------------------------------------------------------*
+*&      Form  SYMBOL_TABLE_CHECK
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->P_<FS_SYMBOLS>_NAME  text
+*      <--P_LS_DATA  text
+*----------------------------------------------------------------------*
+FORM symbol_info_collect USING    us_symbol TYPE itcst
+                         CHANGING cs_data   LIKE LINE OF gt_data.
+
+  DATA: lv_tname  TYPE tabname,
+        ls_dd02v  TYPE dd02v,
+        ls_dd09l  TYPE dd09l,
+        lt_parts  TYPE TABLE OF tdsymbname,
+        ls_parts  TYPE tdsymbname,
+        ls_symbol TYPE symbol,
+        lv_syst   TYPE xfeld,
+        lv_prog   TYPE xfeld,
+        lv_stnd   TYPE xfeld.
+
+* check if symbol is already known
+  READ TABLE gs_form-symbols INTO ls_symbol
+                             WITH KEY symbol = us_symbol-name.
+
+  IF sy-subrc = 0.
+*   create comment about symbol
+    PERFORM auto_comment_symbol
+            USING    ls_symbol
+            CHANGING cs_data.
+
+    RETURN.
+  ENDIF.
+
+  ls_symbol-symbol = us_symbol-name.
+
+* otherwise have a look if it is a structure defined by TABLES
+  SPLIT us_symbol-name AT '-' INTO TABLE lt_parts.
+  IF sy-subrc = 0.
+    READ TABLE lt_parts INTO ls_parts INDEX 1.
+    IF sy-subrc = 0.
+
+      lv_tname = ls_parts.
+
+*     check global memory with database table information first
+      READ TABLE gt_dd09l INTO ls_dd09l
+                          WITH KEY tabname = lv_tname.
+
+      IF sy-subrc <> 0.
+*       read technical information about database table
+        CALL FUNCTION 'DD_INT_TABL_GET'
+          EXPORTING
+            tabname        = lv_tname
+*           LANGU          = SY-LANGU
+          IMPORTING
+*           GOTSTATE       =
+*           GOTSTATE_T     =
+            dd02v_a        = ls_dd02v
+*           DD02V_N        =
+            dd09l_a        = ls_dd09l
+*           DD09L_N        =
+*         TABLES
+*           DD03P_A        =
+*           DD03P_N        =
+*           DD05M_A        =
+*           DD05M_N        =
+*           DD08V_A        =
+*           DD08V_N        =
+*           DD35V_A        =
+*           DD35V_N        =
+*           DD36M_A        =
+*           DD36M_N        =
+          EXCEPTIONS
+            internal_error = 1
+            OTHERS         = 2.
+
+        IF sy-subrc = 0.
+          APPEND ls_dd02v TO gt_dd02v.
+          APPEND ls_dd09l TO gt_dd09l.
+        ENDIF.
+      ENDIF.
+
+      IF ls_dd02v IS INITIAL.
+        READ TABLE gt_dd02v INTO ls_dd02v
+                            WITH KEY tabname    = lv_tname
+                                     ddlanguage = sy-langu.
+
+        IF sy-subrc <> 0. " no error handling
+        ENDIF.
+      ENDIF.
+
+      ls_symbol-tabname  = lv_tname.
+      ls_symbol-tabart   = ls_dd09l-tabart.
+      ls_symbol-tabclass = ls_dd02v-tabclass.
+      ls_symbol-ddtext   = ls_dd02v-ddtext.
+    ENDIF.
+  ENDIF.
+
+* check the origin of the symbol
+  IF pa_prprg IS NOT INITIAL.
+    CALL FUNCTION 'GET_TEXTSYMBOL_TYPE'
+      EXPORTING
+        i_symbolname        = us_symbol-name
+        i_language          = pa_flang
+      IMPORTING
+        e_is_systemsymbol   = lv_syst
+        e_is_programsymbol  = lv_prog
+        e_is_standardsymbol = lv_stnd
+      CHANGING
+        c_program           = pa_prprg.
+
+    IF lv_syst = gc_yes.
+      ls_symbol-type = 'SYST'.
+      gs_stats-ssyst = gs_stats-ssyst + 1.
+    ELSEIF lv_prog = gc_yes.
+      ls_symbol-type = 'PROG'.
+      gs_stats-sprog = gs_stats-sprog + 1.
+    ELSEIF lv_stnd = gc_yes.
+      ls_symbol-type = 'STND'.
+      gs_stats-sstnd = gs_stats-sstnd + 1.
+    ELSE.
+      ls_symbol-type = 'FORM'.
+      gs_stats-sform = gs_stats-sform + 1.
+    ENDIF.
+  ENDIF.
+
+  APPEND ls_symbol TO gs_form-symbols.
+
+* create comment about symbol
+  PERFORM auto_comment_symbol
+          USING    ls_symbol
+          CHANGING cs_data.
+
+ENDFORM.
+*&---------------------------------------------------------------------*
+*&      Form  PRINT_PROGRAM_F4
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM print_program_f4.
+
+  DATA: lt_dynpf TYPE TABLE OF dynpread,
+        ls_dynpf TYPE dynpread,
+        lv_fname LIKE pa_fname.
+
+  ls_dynpf-fieldname = 'PA_FNAME'.
+  APPEND ls_dynpf TO lt_dynpf.
+
+* get current values from selection screen
+  CALL FUNCTION 'DYNP_VALUES_READ'
+    EXPORTING
+      dyname               = sy-repid
+      dynumb               = '1000'
+*     TRANSLATE_TO_UPPER   = ' '
+*     REQUEST              = ' '
+*     PERFORM_CONVERSION_EXITS       = ' '
+*     PERFORM_INPUT_CONVERSION       = ' '
+*     DETERMINE_LOOP_INDEX = ' '
+*     START_SEARCH_IN_CURRENT_SCREEN = ' '
+*     START_SEARCH_IN_MAIN_SCREEN    = ' '
+*     START_SEARCH_IN_STACKED_SCREEN = ' '
+*     START_SEARCH_ON_SCR_STACKPOS   = ' '
+*     SEARCH_OWN_SUBSCREENS_FIRST    = ' '
+*     SEARCHPATH_OF_SUBSCREEN_AREAS  = ' '
+    TABLES
+      dynpfields           = lt_dynpf
+    EXCEPTIONS
+      invalid_abapworkarea = 1
+      invalid_dynprofield  = 2
+      invalid_dynproname   = 3
+      invalid_dynpronummer = 4
+      invalid_request      = 5
+      no_fielddescription  = 6
+      invalid_parameter    = 7
+      undefind_error       = 8
+      double_conversion    = 9
+      stepl_not_found      = 10
+      OTHERS               = 11.
+
+  IF sy-subrc <> 0.
+    MESSAGE 'Error showing F4-Help.' TYPE 'I'.
+    RETURN.
+  ENDIF.
+
+  READ TABLE lt_dynpf INTO ls_dynpf
+                      WITH KEY fieldname = 'PA_FNAME'.
+
+  IF sy-subrc <> 0.
+    MESSAGE 'Error showing F4-Help.' TYPE 'I'.
+    RETURN.
+  ENDIF.
+
+  IF ls_dynpf-fieldvalue IS INITIAL.
+    MESSAGE 'Please choose a form first.' TYPE 'I'.
+    RETURN.
+  ENDIF.
+
+  lv_fname = ls_dynpf-fieldvalue.
+
+  CALL FUNCTION 'SAPSCRIPT_SELECT_PROGRAM'
+    EXPORTING
+      form    = lv_fname
+    IMPORTING
+      program = pa_prprg
+    EXCEPTIONS
+      no_form = 1
+      cancel  = 2
+      OTHERS  = 3.
+
+  CASE sy-subrc.
+    WHEN 0 OR 2.
+      RETURN.
+
+    WHEN 1.
+      MESSAGE 'Please choose a valid form.' TYPE 'I'.
+
+    WHEN OTHERS.
+      MESSAGE 'Error showing F4-Help.' TYPE 'I'.
+  ENDCASE.
+
+ENDFORM.
+*&---------------------------------------------------------------------*
+*&      Form  AUTO_COMMENT_SYMBOL
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->P_LS_SYMBOL  text
+*      <--P_CS_DATA  text
+*----------------------------------------------------------------------*
+FORM auto_comment_symbol USING    us_symbol TYPE symbol
+                         CHANGING cs_data   LIKE LINE OF gt_data.
+
+  DATA lv_comment TYPE text1024.
+
+* check if comment is already generated
+  IF cs_data-acomment CS us_symbol-tabname.
+    RETURN.
+  ENDIF.
+
+* comments can only be 128 characters long, pay attention
+* to note 422660
+
+  IF us_symbol-tabclass = 'TRANSP'.
+    IF us_symbol-tabart = 'APPL0'.
+      lv_comment = 'master data table'.
+    ELSEIF us_symbol-tabart = 'APPL1'.
+      lv_comment = 'transaction data table'.
+    ELSEIF us_symbol-tabart = 'APPL2'.
+      lv_comment = 'organizational table'.
+    ELSE.
+      lv_comment = 'table'.
+    ENDIF.
+  ELSEIF us_symbol-tabclass = 'VIEW'.
+    lv_comment = 'view'.
+  ELSEIF us_symbol-tabclass = 'INTTAB'.
+    lv_comment = 'structure'.
+  ENDIF.
+
+  IF lv_comment IS INITIAL.
+    RETURN.
+  ENDIF.
+
+  CONCATENATE lv_comment
+              us_symbol-tabname
+              '('
+              INTO lv_comment
+              SEPARATED BY space.
+
+  CONCATENATE lv_comment
+              us_symbol-ddtext
+              ')'
+              INTO lv_comment.
+
+  IF cs_data-acomment IS INITIAL.
+    cs_data-acomment = lv_comment.
+  ELSE.
+    CONCATENATE cs_data-acomment
+                '||'
+                lv_comment
+                INTO cs_data-acomment
+                SEPARATED BY space.
+  ENDIF.
 
 ENDFORM.
